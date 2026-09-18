@@ -15,7 +15,12 @@ class DecodeModel(torch.nn.Module):
     in_channels = 4
 
     def _decode_graph_forward(self, entry):
-        return entry.hidden.sin() + entry.k[0].mean() + entry.v[0].mean() + entry.freqs[None, :, :]
+        return (
+            entry.hidden.sin()
+            + entry.k[0].mean(dim=(1, 2, 3))[:, None, None]
+            + entry.v[0].mean(dim=(1, 2, 3))[:, None, None]
+            + entry.freqs[None, :, :]
+        )
 
 
 @pytest.fixture
@@ -170,3 +175,90 @@ def test_replay_uses_active_request_and_layout(graph_case):
         torch.testing.assert_close(other, torch.ones_like(other).sin() + 5 + 6 + 1)
         torch.testing.assert_close(decode(manager, first), original)
         assert all(entry.captures == 1 for entry in manager.entries.values())
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("inference", [False, True])
+def test_prefix_reuse_refreshes_every_layer_without_retaining_requests(graph_case, inference):
+    manager, device, _ = graph_case
+    with torch.inference_mode(inference):
+        cache = make_cache(device, 1.0) + make_cache(device, 2.0)
+        register(manager, cache)
+        entry = next(iter(manager.entries.values()))
+        entry.refresh_prefix(cache)
+        versions = [tensor._version for tensor in entry.k + entry.v]
+        entry.refresh_prefix(cache)
+        assert versions == [tensor._version for tensor in entry.k + entry.v]
+        cache[1]["cond"]["value"] = torch.full_like(cache[1]["cond"]["value"], 7.0)
+        entry.refresh_prefix(cache)
+        assert bool((entry.v[1] == 7).all())
+        source = weakref.ref(cache[0]["cond"]["key"])
+        del cache
+        assert source() is None
+
+
+@pytest.mark.cpu
+def test_prefix_reuse_detects_inplace_changes_and_prefill_registration(graph_case):
+    manager, device, _ = graph_case
+    cache = make_cache(device, 1.0)
+    register(manager, cache)
+    entry = next(iter(manager.entries.values()))
+    entry.refresh_prefix(cache)
+    cache[0]["cond"]["value"].add_(3)
+    entry.refresh_prefix(cache)
+    assert bool((entry.v[0] == 5).all())
+    register(manager, cache)
+    assert not entry.prefix_sources
+
+
+@pytest.mark.cpu
+def test_all_valid_mask_shares_graph_entry_and_padding_falls_back(graph_case):
+    manager, device, _ = graph_case
+    cache = make_cache(device, 1.0)
+    register(manager, cache)
+    entry = next(iter(manager.entries.values()))
+    for valid in (True, False):
+        manager.register_prefill(
+            kv_cache=cache,
+            cache_branch="cond",
+            prefix_len=2,
+            img_shapes=[(1, 2, 2)],
+            target_freqs=torch.ones(4, 4),
+            joint_key_valid=torch.full((1, 6), valid),
+            dtype=torch.float32,
+        )
+        assert list(manager.entries.values()) == [entry]
+        assert entry.attn_metadata is None
+
+
+@pytest.mark.cuda
+@pytest.mark.gpu
+def test_batch_changes_and_padding_do_not_reuse_stale_prefix(graph_case):
+    manager, device, _ = graph_case
+    first = make_cache(device, 1.0)
+    second = make_cache(device, 4.0)
+    merged = [
+        {"cond": {part: torch.cat([first[0]["cond"][part], second[0]["cond"][part]]) for part in ("key", "value")}}
+    ]
+    with torch.inference_mode():
+        register(manager, first)
+        single = decode(manager, first).clone()
+        register(manager, merged)
+        kwargs = dict(
+            hidden_states=torch.ones(2, 4, 4, device=device),
+            timestep=torch.ones(2, device=device),
+            kv_cache=merged,
+            cache_branch="cond",
+            img_shapes=[(1, 2, 2)],
+            img_mask=torch.tensor([[False, False, True]] * 2, device=device),
+            encoder_hidden_states_mask=torch.ones(2, 3, dtype=torch.bool, device=device),
+        )
+        result = manager.try_decode(**kwargs)
+        assert result is not None and result.shape == (2, 4, 4)
+        expected = torch.ones_like(result).sin() + torch.tensor([5.0, 11.0], device=device)[:, None, None]
+        torch.testing.assert_close(result, expected)
+        kwargs["kv_cache"] = [{"cond": {part: tensor.flip(0) for part, tensor in merged[0]["cond"].items()}}]
+        torch.testing.assert_close(manager.try_decode(**kwargs), expected.flip(0))
+        kwargs["encoder_hidden_states_mask"][1, 0] = False
+        assert manager.try_decode(**kwargs) is None
+        torch.testing.assert_close(decode(manager, first), single, rtol=0, atol=0)

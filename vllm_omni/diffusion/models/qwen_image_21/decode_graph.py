@@ -9,9 +9,9 @@ default cache stores prefix K/V in freshly allocated tensors, so a captured
 graph would bind addresses that the next request (or a step-mode cache merge)
 no longer owns.
 
-Requests retain ownership of their prefix K/V. Each decode copies the active
-request's K/V into separate fixed-address graph buffers before replay. Graphs
-are keyed by branch, batch, prefix length, complete image layout, mask presence,
+Requests retain ownership of their prefix K/V. Decode refreshes separate
+fixed-address graph buffers when the active prefix tensors change. Graphs
+are keyed by branch, batch, prefix length, complete image layout,
 dtype, device and backend, so equal token counts with different RoPE layouts stay separate.
 
 Memory note: graph entries own an additional copy of the prefix K/V. Decode
@@ -27,6 +27,7 @@ capture failure.
 
 from __future__ import annotations
 
+import weakref
 from collections import OrderedDict
 from typing import TYPE_CHECKING
 
@@ -34,7 +35,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
-from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -82,7 +82,6 @@ class QwenImage21DecodeGraphEntry:
         kv_shapes: list[torch.Size],
         kv_dtype: torch.dtype,
         freqs: torch.Tensor,
-        use_attention_mask: bool,
     ):
         self.branch = branch
         self.target_tokens = target_tokens
@@ -98,20 +97,30 @@ class QwenImage21DecodeGraphEntry:
             # inference_mode, and the captured body takes views of this tensor
             # outside it, which is forbidden for inference tensors.
             self.freqs = freqs.clone()
-            # Preserve eager attention dispatch even when every key is valid.
-            # Removing an all-true mask can select a numerically different kernel.
-            self.attn_metadata = (
-                AttentionMetadata(
-                    attn_mask=torch.ones(batch_size, prefix_len + target_tokens, dtype=torch.bool, device=device)
-                )
-                if use_attention_mask
-                else None
-            )
+            self.attn_metadata = None
         # Per-block cache dicts with the same shape as the legacy protocol.
         self.block_caches = [{branch: {"key": self.k[i], "value": self.v[i]}} for i in range(len(kv_shapes))]
         self.graph: torch.cuda.CUDAGraph | None = None
         self.output: torch.Tensor | None = None
         self.captures = 0
+        self.prefix_sources: list[tuple[weakref.ReferenceType[torch.Tensor], int | None]] = []
+
+    def refresh_prefix(self, kv_cache: list[dict[str, dict[str, torch.Tensor]]]) -> None:
+        sources = [block[self.branch][name] for block in kv_cache for name in ("key", "value")]
+        versions = [None if tensor.is_inference() else tensor._version for tensor in sources]
+        if len(sources) == len(self.prefix_sources) and all(
+            previous() is tensor and version == current_version
+            for (previous, version), tensor, current_version in zip(self.prefix_sources, sources, versions)
+        ):
+            return
+        # Prefill replaces inference-mode tensors; decode treats them as immutable.
+        # Weak references avoid retaining completed requests or mistaking a reused
+        # allocation for the same prefix. Normal tensors also track in-place writes.
+        self.prefix_sources = []
+        for i, block in enumerate(kv_cache):
+            self.k[i].copy_(block[self.branch]["key"])
+            self.v[i].copy_(block[self.branch]["value"])
+        self.prefix_sources = [(weakref.ref(tensor), version) for tensor, version in zip(sources, versions)]
 
     def capture(self, body) -> None:
         """Warm up on a side stream, then capture one decode step.
@@ -241,7 +250,6 @@ class QwenImage21DecodeGraphManager:
             batch_size,
             prefix_len,
             tuple(tuple(shape) for shape in img_shapes),
-            joint_key_valid is not None,
             dtype,
             first["key"].device.index,
             self._backend_name(),
@@ -265,7 +273,6 @@ class QwenImage21DecodeGraphManager:
                     kv_shapes=[block_cache[cache_branch]["key"].shape for block_cache in kv_cache],
                     kv_dtype=first["key"].dtype,
                     freqs=target_freqs,
-                    use_attention_mask=joint_key_valid is not None,
                 )
             except torch.OutOfMemoryError as exc:
                 allocation_error = str(exc)
@@ -281,6 +288,10 @@ class QwenImage21DecodeGraphManager:
                 return
         else:
             self.entries.move_to_end(key)
+
+        entry = self.entries[key]
+        if entry is not None:
+            entry.prefix_sources = []
 
         logger.debug(
             "Registered decode graph entry key=%s (entries=%d, captured=%d)",
@@ -324,7 +335,6 @@ class QwenImage21DecodeGraphManager:
             cached_key.shape[0],
             cached_key.shape[1],
             tuple(tuple(shape) for shape in img_shapes),
-            encoder_hidden_states_mask is not None,
             hidden_states.dtype,
             cached_key.device.index,
             self._backend_name(),
@@ -337,10 +347,7 @@ class QwenImage21DecodeGraphManager:
         entry.hidden.copy_(hidden_states[:, -entry.target_tokens :])
         entry.timestep.copy_(timestep)
         # Graph buffers are scratch space; request caches must never alias them.
-        for i, block_cache in enumerate(kv_cache):
-            parts = block_cache[cache_branch]
-            entry.k[i].copy_(parts["key"])
-            entry.v[i].copy_(parts["value"])
+        entry.refresh_prefix(kv_cache)
 
         if entry.graph is None:
             capture_error = None

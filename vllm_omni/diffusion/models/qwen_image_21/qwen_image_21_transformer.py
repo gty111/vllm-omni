@@ -1045,6 +1045,9 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             joint_key_valid = F.pad(joint_key_valid, (0, sp_padding), value=False)
 
         has_padding = joint_key_valid is not None and not bool(joint_key_valid.all())
+        if not has_padding:
+            # Match Diffusers and use the same mask-free dispatch in eager and graph decode.
+            joint_key_valid = None
         attn_metadata: AttentionMetadata | None = None
         cache_write_len: int | None = None
         if is_decode:
@@ -1118,8 +1121,8 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         """The exact decode-step computation, captured into a CUDA graph.
 
         Mirrors the eager decode path of ``forward``: target tokens only,
-        prefix K/V read from the entry's static buffers, the same unpadded
-        attention mask as eager decode, and an all-ones modulation mask.
+        prefix K/V read from the entry's static buffers, the same mask-free
+        attention dispatch as eager decode, and an all-ones modulation mask.
         All inputs live in the entry's fixed-address buffers.
         """
         hidden_states = self.img_in(entry.hidden)
