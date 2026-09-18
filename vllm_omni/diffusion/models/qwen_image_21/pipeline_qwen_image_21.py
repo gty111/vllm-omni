@@ -143,7 +143,8 @@ def get_qwen_image_21_pre_process_func(
         if "additional_information" not in prompt:
             prompt["additional_information"] = {}
 
-        if raw_image is None or (isinstance(raw_image, list) and len(raw_image) == 0):
+        if not raw_image:  # None or empty list: pure text-to-image request
+            request.batch_compatibility_key = ("qwen_image_21", ())
             request.prompt = prompt
             return request
 
@@ -187,6 +188,7 @@ def get_qwen_image_21_pre_process_func(
         prompt["additional_information"]["input_image_sizes"] = input_image_sizes
         prompt["additional_information"]["calculated_height"] = calculated_height
         prompt["additional_information"]["calculated_width"] = calculated_width
+        request.batch_compatibility_key = ("qwen_image_21", tuple(input_image_sizes))
         request.prompt = prompt
         return request
 
@@ -549,7 +551,12 @@ class QwenImage21Pipeline(
         if getattr(model_inputs, "mm_token_type_ids", None) is not None:
             forward_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
 
-        outputs = self.text_encoder(**forward_kwargs)
+        text_model = getattr(self.text_encoder.model, "language_model", self.text_encoder.model)
+        handle = text_model.norm.register_forward_hook(lambda module, args, output: args[0])
+        try:
+            outputs = self.text_encoder(**forward_kwargs)
+        finally:
+            handle.remove()
         hidden_states = outputs.hidden_states[-1]
 
         split_hidden_states = list(self._extract_masked_hidden(hidden_states, model_inputs.attention_mask))
