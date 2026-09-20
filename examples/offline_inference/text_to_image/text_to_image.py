@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
 import functools
@@ -112,8 +112,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cfg-scale",
         type=float,
-        default=None,
-        help="True classifier-free guidance scale (default: 1.0 for Qwen-Image 2.1, 4.0 otherwise).",
+        default=4.0,
+        help="True classifier-free guidance scale specific to Qwen-Image.",
     )
     parser.add_argument(
         "--guidance-scale",
@@ -481,8 +481,6 @@ def main():
         omni_kwargs["model_config"] = {"guardrails": bool(args.extra_body["guardrails"])}
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
-    if args.cfg_scale is None:
-        args.cfg_scale = 1.0 if model_class_name == "QwenImage21Pipeline" else 4.0
     declared_extra_body_params = get_extra_body_params(model_class_name)
 
     if profiler_enabled:
