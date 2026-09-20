@@ -182,9 +182,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--cfg-scale",
         type=float,
-        default=4.0,
+        default=None,
         help=(
-            "True classifier-free guidance scale (default: 4.0). Guidance scale as defined in Classifier-Free "
+            "True classifier-free guidance scale (default: 1.0 for Qwen-Image 2.1, 4.0 otherwise). "
+            "Guidance scale as defined in Classifier-Free "
             "Diffusion Guidance. Classifier-free guidance is enabled by setting cfg_scale > 1 and providing "
             "a negative_prompt. Higher guidance scale encourages images closely linked to the text prompt, "
             "usually at the expense of lower image quality."
@@ -496,6 +497,8 @@ def main():
         omni_kwargs["deploy_config"] = args.deploy_config
     omni = Omni(**omni_kwargs)
     model_class_name = get_model_class_name(omni)
+    if args.cfg_scale is None:
+        args.cfg_scale = 1.0 if model_class_name == "QwenImage21Pipeline" else 4.0
     declared_extra_body_params = get_extra_body_params(model_class_name)
     print("Pipeline loaded")
 
